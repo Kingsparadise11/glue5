@@ -1,4 +1,6 @@
 
+# Builds one platform from the game.wasm in a draft release.
+# Built game files are uploaded only to the existing draft release.
 name: Build
 
 on:
@@ -38,92 +40,123 @@ jobs:
         run: |
           parent=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent | select(.) | .full_name + " " + .default_branch')
           [ -n "$parent" ] || exit 0
+
           read -r name branch <<<"$parent"
           behind=$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...${name%%/*}:$branch" --jq .ahead_by)
+
           if [ "${behind:-0}" -gt 0 ]; then
-              echo "::warning::This copy is $behind commits behind $name. Sync your fork and update the branch."
+              echo "::warning::This fork is $behind commits behind $name. Sync the fork and update the branch for the latest fixes."
           fi
 
       - uses: actions/checkout@v5
 
+      # Fetch the game first so missing or invalid game.wasm fails early.
       - name: game.wasm from the draft release
         id: game
         run: |
           game=$RUNNER_TEMP/game
-          if [ "$RUNNER_OS" = Windows ]; then
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
               game=$(cygpath -m "$game")
           fi
+
           .github/scripts/draft.sh fetch "$game"
           echo "GLUE5_GAME_DIR=$game" >> "$GITHUB_ENV"
 
-      # Configure MSVC without using the reserved PLATFORM variable.
+      # Configure the native Windows C/C++ build environment.
       - name: Set up MSVC
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # Find clang-cl or install LLVM if it is missing.
-      - name: Git Bash and clang-cl
+      # Find the real MSVC linker and clang-cl.
+      - name: Configure Windows compiler tools
         if: runner.os == 'Windows'
         run: |
           echo "MISE_BASH_PATH=$(cygpath -w /)bin\\bash.exe" >> "$GITHUB_ENV"
 
-          find_clang() {
-              local candidate
-              local vswhere
+          vswhere=$(cygpath -u 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe')
 
-              candidate=$(command -v clang-cl.exe 2>/dev/null || true)
-              if [ -n "$candidate" ]; then
-                  printf '%s\n' "$candidate"
-                  return 0
-              fi
+          if [ ! -f "$vswhere" ]; then
+              echo "::error::Visual Studio Installer vswhere.exe was not found."
+              exit 1
+          fi
 
-              candidate='C:\Program Files\LLVM\bin\clang-cl.exe'
-              if [ -f "$(cygpath -u "$candidate")" ]; then
-                  printf '%s\n' "$candidate"
-                  return 0
-              fi
+          vs_install=$("$vswhere" -latest -products '*' \
+              -property installationPath 2>/dev/null | tr -d '\r')
 
-              vswhere=$(cygpath -u 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe')
+          if [ -z "$vs_install" ]; then
+              echo "::error::No Visual Studio installation was found."
+              exit 1
+          fi
 
-              if [ -f "$vswhere" ]; then
-                  candidate=$("$vswhere" -latest -products '*' \
-                      -find 'VC\Tools\Llvm\**\bin\clang-cl.exe' 2>/dev/null \
-                      | tr -d '\r' | head -n 1)
+          # Locate Microsoft's linker for the x64 MSVC target.
+          msvc_root="$(cygpath -u "$vs_install")/VC/Tools/MSVC"
 
-                  if [ -n "$candidate" ] && [ -f "$(cygpath -u "$candidate")" ]; then
-                      printf '%s\n' "$candidate"
-                      return 0
-                  fi
-              fi
+          if [ ! -d "$msvc_root" ]; then
+              echo "::error::The MSVC compiler tools directory was not found: $msvc_root"
+              exit 1
+          fi
 
-              return 1
-          }
+          link_unix=$(find "$msvc_root" \
+              -type f \
+              -path '*/bin/Hostx64/x64/link.exe' \
+              -print 2>/dev/null | sort -V | tail -n 1)
 
-          clang=$(find_clang || true)
+          if [ -z "$link_unix" ] || [ ! -f "$link_unix" ]; then
+              echo "::error::MSVC x64 link.exe was not found. Check the Visual Studio C++ build tools."
+              exit 1
+          fi
 
-          if [ -z "$clang" ]; then
-              echo "clang-cl not found. Installing LLVM..."
-              choco install llvm --yes --no-progress
+          link_win=$(cygpath -w "$link_unix")
+          link_dir_win=$(cygpath -w "$(dirname "$link_unix")")
 
-              clang='C:\Program Files\LLVM\bin\clang-cl.exe'
+          # Force Cargo/Rust to use the actual Microsoft linker.
+          echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$link_win" >> "$GITHUB_ENV"
 
-              if [ ! -f "$(cygpath -u "$clang")" ]; then
-                  echo "::error::LLVM installed, but clang-cl.exe was not found."
-                  exit 1
+          # Also expose the MSVC linker directory to subsequent steps.
+          echo "$link_dir_win" >> "$GITHUB_PATH"
+
+          # Find clang-cl in the standalone LLVM installation first.
+          clang_win='C:\Program Files\LLVM\bin\clang-cl.exe'
+
+          if [ ! -f "$(cygpath -u "$clang_win")" ]; then
+              # Then check Visual Studio's bundled LLVM.
+              clang_win=$("$vswhere" -latest -products '*' \
+                  -find 'VC\Tools\Llvm\x64\bin\clang-cl.exe' 2>/dev/null \
+                  | tr -d '\r' | head -n 1)
+
+              if [ -z "$clang_win" ] || [ ! -f "$(cygpath -u "$clang_win")" ]; then
+                  clang_win=""
               fi
           fi
 
-          clang_dir=$(dirname "$clang")
-          clang_dir_unix=$(cygpath -u "$clang_dir")
+          # Install LLVM if neither location contains clang-cl.
+          if [ -z "$clang_win" ]; then
+              echo "clang-cl was not found; installing LLVM."
+              choco install llvm --yes --no-progress
 
-          echo "$clang_dir" >> "$GITHUB_PATH"
-          export PATH="$clang_dir_unix:$PATH"
+              clang_win='C:\Program Files\LLVM\bin\clang-cl.exe'
+          fi
 
-          echo "Using compiler: $clang"
-          clang-cl.exe --version
+          clang_unix=$(cygpath -u "$clang_win")
 
+          if [ ! -f "$clang_unix" ]; then
+              echo "::error::clang-cl.exe was not found after LLVM setup."
+              exit 1
+          fi
+
+          clang_dir_win=$(cygpath -w "$(dirname "$clang_unix")")
+          echo "$clang_dir_win" >> "$GITHUB_PATH"
+
+          echo "MSVC linker: $link_win"
+          echo "Clang compiler: $clang_win"
+
+          "$link_unix" /?
+          "$clang_unix" --version
+
+      # The Icon Composer icon requires Xcode 26.
       - name: Xcode 26
         if: runner.os == 'macOS'
         run: |
@@ -144,6 +177,7 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
 
+      # Install platform-specific tools through mise.
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca
         with:
           version: 2026.7.5
@@ -151,6 +185,7 @@ jobs:
           install_args: ${{ fromJSON('{"ios":"rust cmake xcodegen","macos":"rust cmake cargo:cargo-packager","android":"rust cmake java gradle android-sdk cargo:cargo-ndk","windows":"rust cmake"}')[inputs.platform] }}
           cache_key_prefix: mise-${{ inputs.platform }}
 
+      # Preserve the Android signing key in the draft release.
       - name: Android signing key
         if: inputs.platform == 'android'
         run: |
@@ -159,6 +194,7 @@ jobs:
           echo "ANDROID_USER_HOME=$HOME/.android" >> "$GITHUB_ENV"
 
           cd ~/.android
+
           "$GITHUB_WORKSPACE/.github/scripts/draft.sh" get \
               "${{ steps.game.outputs.release }}" Glue5-android.keystore
 
@@ -166,10 +202,14 @@ jobs:
               mv Glue5-android.keystore debug.keystore
           else
               mise -C "$GITHUB_WORKSPACE" exec -- keytool -genkeypair \
-                  -noprompt -keystore debug.keystore \
-                  -storepass android -keypass android \
-                  -alias androiddebugkey -keyalg RSA \
-                  -keysize 2048 -validity 10000 \
+                  -noprompt \
+                  -keystore debug.keystore \
+                  -storepass android \
+                  -keypass android \
+                  -alias androiddebugkey \
+                  -keyalg RSA \
+                  -keysize 2048 \
+                  -validity 10000 \
                   -dname "CN=Android Debug,O=Android,C=US"
           fi
 
@@ -182,24 +222,37 @@ jobs:
               mise run ios:ipa
               mv target/ios/Glue5.ipa Glue5-ios.ipa
               ;;
+
           windows)
+              # Git Bash prepends its GNU tools at the start of each step.
+              # Remove the conflicting GNU link utility in THIS build step.
+              rm -f /usr/bin/link.exe /usr/bin/link
+              hash -r
+
+              # Cargo also has an explicit path to the real MSVC linker.
+              echo "Configured MSVC linker: $CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"
               clang-cl.exe --version
+
               mise run build
               mv target/release/glue5.exe Glue5-windows.exe
               ;;
+
           macos)
               mise run macos:package
               mv target/package/*.dmg Glue5-macos.dmg
               ;;
+
           android)
               mise run android:build
               mv target/android/gradle/outputs/apk/release/Glue5-release.apk Glue5-android.apk
               cp ~/.android/debug.keystore Glue5-android.keystore
               ;;
+
           linux-*)
               mise run linux:container "${BUILD_PLATFORM#linux-}"
               mv target/package/*.AppImage "Glue5-$BUILD_PLATFORM.AppImage"
               ;;
+
           *)
               echo "::error::Unsupported platform: $BUILD_PLATFORM"
               exit 1
@@ -208,5 +261,7 @@ jobs:
 
       - name: Into the draft release
         run: |
-          .github/scripts/draft.sh upload "${{ steps.game.outputs.release }}" Glue5-*
+          .github/scripts/draft.sh upload \
+              "${{ steps.game.outputs.release }}" Glue5-*
+
           echo "Built for $BUILD_PLATFORM: the files are in the draft release, under $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases (keep it a draft)." >> "$GITHUB_STEP_SUMMARY"
