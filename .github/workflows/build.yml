@@ -1,7 +1,5 @@
-# Builds the app for one platform, by hand (Actions > Build > Run workflow),
-# from the game.wasm in a draft release of this repository, and puts the
-# result into that draft: nothing built from the game is published. Meant
-# for forks: see docs/github-build.md.
+
+# Builds the app for one platform, by hand (Actions > Build > Run workflow).
 name: Build
 
 on:
@@ -22,22 +20,20 @@ concurrency:
 jobs:
   build:
     name: ${{ inputs.platform }}
-    # Apple: macos-15, whose machines are many more than macos-26's (a job
-    # there could be cancelled after waiting for one), with Xcode 26 (below).
     runs-on: ${{ fromJSON('{"ios":"macos-15","macos":"macos-15","android":"ubuntu-24.04","linux-x86_64":"ubuntu-24.04","linux-aarch64":"ubuntu-24.04-arm","windows":"windows-2025"}')[inputs.platform] }}
     timeout-minutes: 360
+
     defaults:
       run:
         shell: bash
+
     env:
       GH_TOKEN: ${{ github.token }}
       PLATFORM: ${{ inputs.platform }}
       MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
-      # The tools each platform needs are installed below, not all of them.
       MISE_TASK_RUN_AUTO_INSTALL: "false"
+
     steps:
-      # A fork behind this project builds without its latest fixes: said,
-      # but the build goes on.
       - name: Up to date
         continue-on-error: true
         run: |
@@ -46,64 +42,117 @@ jobs:
           read -r name branch <<<"$parent"
           behind=$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...${name%%/*}:$branch" --jq .ahead_by)
           if [ "${behind:-0}" -gt 0 ]; then
-              echo "::warning::This copy is $behind commits behind $name, without its latest fixes. On its main page press \"Sync fork\", then \"Update branch\", and build again."
+              echo "::warning::This copy is $behind commits behind $name. Sync your fork and update the branch."
           fi
 
       - uses: actions/checkout@v5
 
-      # First, so that a missing or wrong game.wasm fails in seconds. No
-      # cache anywhere: the game's code and what is built from it stay in
-      # the draft.
+      # Fetch the game before installing the build tools.
       - name: game.wasm from the draft release
         id: game
         run: |
           game=$RUNNER_TEMP/game
-          # Windows: D:/a/_temp/game, a path for Git's bash and for cargo alike.
-          if [ "$RUNNER_OS" = Windows ]; then game=$(cygpath -m "$game"); fi
+          if [ "$RUNNER_OS" = Windows ]; then
+              game=$(cygpath -m "$game")
+          fi
           .github/scripts/draft.sh fetch "$game"
-          echo "GLUE5_GAME_DIR=$game" >>"$GITHUB_ENV"
+          echo "GLUE5_GAME_DIR=$game" >> "$GITHUB_ENV"
 
-      # Windows: the tasks run in Git's bash, and the game's C is compiled
-      # with clang-cl (docs/building.md). The machine has Visual Studio and
-      # LLVM, but the build did not find clang-cl on the PATH: LLVM's own,
-      # else the one that comes with Visual Studio, on it.
-      - name: Git's bash and clang-cl
+      # Configure the Visual Studio C/C++ build environment.
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Ensure clang-cl exists, installing LLVM if necessary.
+      - name: Git Bash and clang-cl
         if: runner.os == 'Windows'
         run: |
-          echo "MISE_BASH_PATH=$(cygpath -w /)bin\\bash.exe" >>"$GITHUB_ENV"
-          clang='C:\Program Files\LLVM\bin\clang-cl.exe'
-          if [ ! -f "$(cygpath -u "$clang")" ]; then
-              clang=
-              vswhere=$(cygpath -u 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe')
-              [ ! -f "$vswhere" ] ||
-                  clang=$("$vswhere" -latest -products '*' -find 'VC\Tools\Llvm\x64\bin\clang-cl.exe' | tr -d '\r' | head -n 1)
-          fi
-          if [ -z "$clang" ]; then
-              echo "::error::clang-cl is not on this machine (neither LLVM nor Visual Studio's): GitHub's Windows image has changed."
-              exit 1
-          fi
-          echo "clang-cl: $clang"
-          echo "${clang%\\*}" >>"$GITHUB_PATH"
+          echo "MISE_BASH_PATH=$(cygpath -w /)bin\\bash.exe" >> "$GITHUB_ENV"
 
-      # The app needs Xcode 26 (the Icon Composer icon); macos-15's default
-      # is 16, beside the Xcode 26 releases that run on macOS 15: the newest.
+          find_clang() {
+              local candidate
+
+              # First, check the current PATH.
+              candidate=$(command -v clang-cl.exe 2>/dev/null || true)
+              if [ -n "$candidate" ]; then
+                  printf '%s\n' "$candidate"
+                  return 0
+              fi
+
+              # Check the standard LLVM installation directory.
+              candidate='C:\Program Files\LLVM\bin\clang-cl.exe'
+              if [ -f "$(cygpath -u "$candidate")" ]; then
+                  printf '%s\n' "$candidate"
+                  return 0
+              fi
+
+              # Search Visual Studio installations.
+              local vswhere
+              vswhere=$(cygpath -u 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe')
+
+              if [ -f "$vswhere" ]; then
+                  candidate=$("$vswhere" -latest -products '*' \
+                      -find 'VC\Tools\Llvm\**\bin\clang-cl.exe' 2>/dev/null \
+                      | tr -d '\r' | head -n 1)
+
+                  if [ -n "$candidate" ] && [ -f "$(cygpath -u "$candidate")" ]; then
+                      printf '%s\n' "$candidate"
+                      return 0
+                  fi
+              fi
+
+              return 1
+          }
+
+          clang=$(find_clang || true)
+
+          # Hosted runner images can change. Install LLVM if it is missing.
+          if [ -z "$clang" ]; then
+              echo "clang-cl was not found. Installing LLVM with Chocolatey..."
+              choco install llvm --yes --no-progress
+
+              clang='C:\Program Files\LLVM\bin\clang-cl.exe'
+              if [ ! -f "$(cygpath -u "$clang")" ]; then
+                  echo "::error::LLVM installation completed, but clang-cl.exe was not found."
+                  exit 1
+              fi
+          fi
+
+          clang_dir=$(dirname "$clang")
+          clang_dir_unix=$(cygpath -u "$clang_dir")
+
+          # Make LLVM available to later GitHub Actions steps.
+          echo "$clang_dir" >> "$GITHUB_PATH"
+
+          # Make it available in this Bash process too.
+          export PATH="$clang_dir_unix:$PATH"
+
+          echo "Using compiler: $clang"
+          clang-cl.exe --version
+
+      # Use Xcode 26 on macOS runners.
       - name: Xcode 26
         if: runner.os == 'macOS'
         run: |
-          xcode=$(ls -d /Applications/Xcode_26*.app | grep -E '/Xcode_26(\.[0-9]+)*\.app$' | sort -V | tail -n 1 || true)
+          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null \
+              | grep -E '/Xcode_26(\.[0-9]+)*\.app$' \
+              | sort -V | tail -n 1 || true)
+
           if [ -z "$xcode" ]; then
-              echo "::error::No Xcode 26 on this machine: GitHub's macOS image has changed."
+              echo "::error::No Xcode 26 found on this runner."
               exit 1
           fi
-          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >>"$GITHUB_ENV"
-          DEVELOPER_DIR=$xcode/Contents/Developer xcodebuild -version
+
+          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$xcode/Contents/Developer" xcodebuild -version
 
       - name: Room on the disk
         if: runner.os == 'Linux'
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
 
-      # v5.1.1 (2026-10-04), by its commit: v2 ran on Node 20, which
-      # GitHub has deprecated.
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca
         with:
           version: 2026.7.5
@@ -111,34 +160,40 @@ jobs:
           install_args: ${{ fromJSON('{"ios":"rust cmake xcodegen","macos":"rust cmake cargo:cargo-packager","android":"rust cmake java gradle android-sdk cargo:cargo-ndk","windows":"rust cmake"}')[inputs.platform] }}
           cache_key_prefix: mise-${{ inputs.platform }}
 
-      # The APK's key, kept in the draft: an update signed with another one
-      # would have to replace the app, and that deletes its game folder. The
-      # first build makes it: Gradle does not, on the runner. Gradle reads
-      # it from ANDROID_USER_HOME.
+      # Prepare Android signing key.
       - name: Android signing key
         if: inputs.platform == 'android'
         run: |
           yes | mise exec -- sdkmanager --licenses >/dev/null || true
           mkdir -p ~/.android
-          echo "ANDROID_USER_HOME=$HOME/.android" >>"$GITHUB_ENV"
-          cd ~/.android && "$GITHUB_WORKSPACE/.github/scripts/draft.sh" get "${{ steps.game.outputs.release }}" Glue5-android.keystore
+          echo "ANDROID_USER_HOME=$HOME/.android" >> "$GITHUB_ENV"
+
+          cd ~/.android
+          "$GITHUB_WORKSPACE/.github/scripts/draft.sh" get \
+              "${{ steps.game.outputs.release }}" Glue5-android.keystore
+
           if [ -f Glue5-android.keystore ]; then
               mv Glue5-android.keystore debug.keystore
           else
-              # Android's own debug key, as Gradle would make it.
-              mise -C "$GITHUB_WORKSPACE" exec -- keytool -genkeypair -noprompt -keystore debug.keystore \
-                  -storepass android -keypass android -alias androiddebugkey \
-                  -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+              mise -C "$GITHUB_WORKSPACE" exec -- keytool -genkeypair \
+                  -noprompt -keystore debug.keystore \
+                  -storepass android -keypass android \
+                  -alias androiddebugkey -keyalg RSA \
+                  -keysize 2048 -validity 10000 \
+                  -dname "CN=Android Debug,O=Android,C=US"
           fi
 
+      # Build the selected platform.
       - name: Build
         run: |
-          case $PLATFORM in
+          case "$PLATFORM" in
           ios)
               mise run ios:ipa
               mv target/ios/Glue5.ipa Glue5-ios.ipa
               ;;
           windows)
+              # Confirm the compiler remains available after setup.
+              clang-cl.exe --version
               mise run build
               mv target/release/glue5.exe Glue5-windows.exe
               ;;
@@ -155,9 +210,14 @@ jobs:
               mise run linux:container "${PLATFORM#linux-}"
               mv target/package/*.AppImage "Glue5-$PLATFORM.AppImage"
               ;;
+          *)
+              echo "::error::Unsupported platform: $PLATFORM"
+              exit 1
+              ;;
           esac
 
+      # Upload the finished artifact to the existing draft release.
       - name: Into the draft release
         run: |
           .github/scripts/draft.sh upload "${{ steps.game.outputs.release }}" Glue5-*
-          echo "Built for $PLATFORM: the files are in the draft release, under $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases (keep it a draft)." >>"$GITHUB_STEP_SUMMARY"
+          echo "Built for $PLATFORM: the files are in the draft release, under $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases (keep it a draft)." >> "$GITHUB_STEP_SUMMARY"
