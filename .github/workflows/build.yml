@@ -1,4 +1,5 @@
 
+# Builds one platform from game.wasm in the existing draft release.
 name: Build
 
 on:
@@ -25,7 +26,7 @@ concurrency:
 jobs:
   build:
     name: ${{ inputs.platform }}
-    runs-on: ${{ fromJSON('{"ios":"macos-15","android":"ubuntu-24.04","windows":"windows-2025","macos":"macos-15","linux-x86_64":"ubuntu-24.04","linux-aarch64":"ubuntu-24.04-arm"}')[inputs.platform] }}
+    runs-on: ${{ fromJSON('{"ios":"macos-15","macos":"macos-15","android":"ubuntu-24.04","linux-x86_64":"ubuntu-24.04","linux-aarch64":"ubuntu-24.04-arm","windows":"windows-2025"}')[inputs.platform] }}
     timeout-minutes: 360
 
     defaults:
@@ -45,10 +46,7 @@ jobs:
           parent=$(gh api "repos/$GITHUB_REPOSITORY" \
             --jq '.parent | select(.) | .full_name + " " + .default_branch')
 
-          if [ -z "$parent" ]; then
-            echo "No parent repository detected."
-            exit 0
-          fi
+          [ -n "$parent" ] || exit 0
 
           read -r name branch <<< "$parent"
 
@@ -57,7 +55,7 @@ jobs:
             --jq '.ahead_by')
 
           if [ "${behind:-0}" -gt 0 ]; then
-            echo "::warning::This fork is $behind commits behind $name. Consider syncing it."
+            echo "::warning::This copy is $behind commits behind $name. Consider syncing the fork."
           fi
 
       - name: Checkout repository
@@ -76,19 +74,18 @@ jobs:
 
           echo "GLUE5_GAME_DIR=$game" >> "$GITHUB_ENV"
 
-      # Set up the Visual Studio C++ compiler environment.
       - name: Set up MSVC
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # Configure tools without running LINK /?, which exits with code 76.
-      - name: Configure Windows compiler and linker
+      - name: Configure Windows C compiler and linker
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          echo 'MISE_BASH_PATH=C:\Program Files\Git\bin\bash.exe' >> "$GITHUB_ENV"
+          # Use Git for Windows Bash for mise tasks.
+          echo "MISE_BASH_PATH=$(cygpath -w /)bin\\bash.exe" >> "$GITHUB_ENV"
 
           vswhere=$(cygpath -u 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe')
 
@@ -114,7 +111,7 @@ jobs:
             exit 1
           fi
 
-          # Find Microsoft's real x64 linker.
+          # Locate the real Microsoft x64 linker.
           link_unix=$(
             find "$msvc_root" \
               -type f \
@@ -125,24 +122,24 @@ jobs:
           )
 
           if [ -z "$link_unix" ] || [ ! -f "$link_unix" ]; then
-            echo "::error::Microsoft's x64 link.exe was not found."
+            echo "::error::MSVC x64 linker was not found."
             exit 1
           fi
 
           link_win=$(cygpath -w "$link_unix")
           link_dir_win=$(cygpath -w "$(dirname "$link_unix")")
 
-          # Force Cargo to use Microsoft's linker instead of Git's link.exe.
+          # Explicitly configure Cargo to use Microsoft's linker.
           echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$link_win" >> "$GITHUB_ENV"
 
-          # Make the MSVC linker directory available to later steps.
+          # Also place the MSVC linker directory on the PATH.
           echo "$link_dir_win" >> "$GITHUB_PATH"
 
-          # First check standalone LLVM.
+          # Find standalone LLVM's clang-cl first.
           clang_win='C:\Program Files\LLVM\bin\clang-cl.exe'
 
           if [ ! -f "$(cygpath -u "$clang_win")" ]; then
-            # Then check LLVM bundled with Visual Studio.
+            # Otherwise find the LLVM copy bundled with Visual Studio.
             clang_win=$(
               "$vswhere" -latest -products '*' \
                 -find 'VC\Tools\Llvm\x64\bin\clang-cl.exe' \
@@ -155,9 +152,10 @@ jobs:
             fi
           fi
 
-          # Install LLVM if clang-cl is not already available.
+          # Install LLVM only if neither existing location has clang-cl.
           if [ -z "$clang_win" ]; then
-            echo "Installing LLVM..."
+            echo "clang-cl was not found. Installing LLVM..."
+
             choco install llvm --yes --no-progress
 
             clang_win='C:\Program Files\LLVM\bin\clang-cl.exe'
@@ -166,21 +164,24 @@ jobs:
           clang_unix=$(cygpath -u "$clang_win")
 
           if [ ! -f "$clang_unix" ]; then
-            echo "::error::clang-cl.exe was not found."
+            echo "::error::clang-cl.exe was not found after LLVM setup."
             exit 1
           fi
 
           clang_dir_win=$(cygpath -w "$(dirname "$clang_unix")")
           echo "$clang_dir_win" >> "$GITHUB_PATH"
 
+          # CRITICAL FIX:
+          # Glue5's build script uses this target-specific variable.
+          # Give cc-rs the complete compiler path so it doesn't depend
+          # on finding "clang-cl" through PATH during the Cargo build.
+          echo "CC_x86_64_pc_windows_msvc=$clang_win" >> "$GITHUB_ENV"
+
           echo "MSVC linker: $link_win"
           echo "Clang compiler: $clang_win"
-          echo "Cargo linker override: $CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"
 
-          # Validate the linker file without invoking its help command.
+          # Validate both tools without running LINK /?.
           test -f "$link_unix"
-
-          # Check that Clang executes successfully.
           "$clang_unix" --version
 
       - name: Set up Xcode 26
@@ -228,7 +229,7 @@ jobs:
 
           cd "$HOME/.android"
 
-          . "$GITHUB_WORKSPACE/.github/scripts/draft.sh" get \
+          "$GITHUB_WORKSPACE/.github/scripts/draft.sh" get \
             "${{ steps.game.outputs.release }}" Glue5-android.keystore
 
           if [ -f Glue5-android.keystore ]; then
@@ -257,9 +258,24 @@ jobs:
               ;;
 
             windows)
-              # Confirm Cargo has the explicit Microsoft linker setting.
+              # Confirm the target-specific compiler setting reached this step.
+              if [ -z "${CC_x86_64_pc_windows_msvc:-}" ]; then
+                echo "::error::CC_x86_64_pc_windows_msvc is not set."
+                exit 1
+              fi
+
+              clang_path=$(cygpath -u "$CC_x86_64_pc_windows_msvc")
+
+              if [ ! -f "$clang_path" ]; then
+                echo "::error::Configured clang-cl.exe does not exist: $CC_x86_64_pc_windows_msvc"
+                exit 1
+              fi
+
+              echo "Using C compiler: $CC_x86_64_pc_windows_msvc"
+              "$clang_path" --version
+
               if [ -z "${CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER:-}" ]; then
-                echo "::error::The MSVC linker override is missing."
+                echo "::error::MSVC linker configuration is missing."
                 exit 1
               fi
 
@@ -268,8 +284,7 @@ jobs:
               mise run build
 
               if [ ! -f target/release/glue5.exe ]; then
-                echo "::error::The build completed without producing target/release/glue5.exe."
-                echo "Inspect the build output above for the actual compilation error."
+                echo "::error::target/release/glue5.exe was not produced."
                 exit 1
               fi
 
@@ -303,5 +318,5 @@ jobs:
           .github/scripts/draft.sh upload \
             "${{ steps.game.outputs.release }}" Glue5-*
 
-          echo "Build platform: $BUILD_PLATFORM" >> "$GITHUB_STEP_SUMMARY"
-          echo "The generated files were uploaded to the draft release." >> "$GITHUB_STEP_SUMMARY"
+          echo "Built platform: $BUILD_PLATFORM" >> "$GITHUB_STEP_SUMMARY"
+          echo "Generated files were uploaded to the draft release." >> "$GITHUB_STEP_SUMMARY"
