@@ -1,4 +1,3 @@
-
 # Builds one platform from game.wasm in the existing draft release.
 name: Build
 
@@ -84,6 +83,24 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
+          # ------------------------------------------------------------------
+          # ROOT-CAUSE FIX for:
+          #   linking with `link.exe` failed ... "C:\Program Files\Git\usr\bin\link.exe"
+          #   /usr/bin/link: extra operand ...
+          #
+          # Git for Windows ships a GNU coreutils `link.exe` that shadows
+          # Microsoft's linker. Every bash shell (including the ones mise
+          # spawns, and the nested cargo build that glue5-mods/build.rs starts
+          # for glue5-studio) puts Git's usr/bin at the FRONT of PATH, so no
+          # amount of PATH / env-var juggling reliably wins. Remove it.
+          # ------------------------------------------------------------------
+          git_link=$(cygpath -u 'C:\Program Files\Git\usr\bin\link.exe')
+          if [ -f "$git_link" ]; then
+            echo "Removing Git's GNU link.exe: $git_link"
+            rm -f "$git_link"
+          fi
+          rm -f /usr/bin/link.exe 2>/dev/null || true
+
           # Use Git for Windows Bash for mise tasks.
           echo "MISE_BASH_PATH=$(cygpath -w /)bin\\bash.exe" >> "$GITHUB_ENV"
 
@@ -171,7 +188,6 @@ jobs:
           clang_dir_win=$(cygpath -w "$(dirname "$clang_unix")")
           echo "$clang_dir_win" >> "$GITHUB_PATH"
 
-          # CRITICAL FIX:
           # Glue5's build script uses this target-specific variable.
           # Give cc-rs the complete compiler path so it doesn't depend
           # on finding "clang-cl" through PATH during the Cargo build.
@@ -280,6 +296,21 @@ jobs:
               fi
 
               echo "Using MSVC linker: $CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"
+
+              # Put Microsoft's linker directory first on PATH and make sure
+              # a bare `link.exe` can no longer resolve to Git's GNU `link`.
+              msvc_link_unix=$(cygpath -u "$CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER")
+              export PATH="$(dirname "$msvc_link_unix"):$PATH"
+
+              resolved_link=$(command -v link.exe || true)
+              echo "link.exe resolves to: ${resolved_link:-<none>}"
+
+              case "$resolved_link" in
+                */Git/usr/bin/*|*/usr/bin/link.exe)
+                  echo "::error::link.exe still resolves to Git's GNU link: $resolved_link"
+                  exit 1
+                  ;;
+              esac
 
               mise run build
 
