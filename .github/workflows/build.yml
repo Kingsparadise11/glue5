@@ -263,6 +263,25 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
+      - name: Patch glue5-runtime type inference error (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          # On Windows, give_back() in memory.rs only does `let _ = ptr;`, so
+          # nothing tells rustc what `.cast()` should produce:
+          #   error[E0282]: type annotations needed for `*mut _`
+          # Annotating the type fixes it. This is a no-op once the source
+          # already has the annotation (e.g. after you commit the fix or
+          # sync your fork), so it is safe to leave in.
+          file=crates/glue5-runtime/src/memory.rs
+
+          if grep -q 'let ptr = mem.ptr(first \* page_size()).cast();' "$file"; then
+            sed -i 's|let ptr = mem.ptr(first \* page_size()).cast();|let ptr: *mut std::ffi::c_void = mem.ptr(first * page_size()).cast();|' "$file"
+            echo "Patched $file"
+            grep -n 'let ptr: \*mut std::ffi::c_void' "$file"
+          else
+            echo "No patch needed for $file"
+          fi
+
       - name: Build
         run: |
           echo "Building platform: $BUILD_PLATFORM"
